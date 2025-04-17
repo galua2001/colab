@@ -1,0 +1,217 @@
+using System.Collections.Generic;
+using UnityEngine;
+
+public class Draw : MonoBehaviour
+{
+    public enum PreTransform 
+    { None, Rotate180, MirrorY, MirrorX, Rotate90, MirrorDiagonal, MirrorAntiDiagonal }
+    [Header("플레이 전 사전 변형")]
+    public PreTransform preTransform = PreTransform.None;
+
+    [Header("곡선 색상 및 카메라 설정")]
+    public Color curveColor = Color.red;
+    public Camera mainCamera; // 비워두면 Camera.main 사용
+
+    public static Draw mainController = null;
+    public static List<Draw> instances     = new List<Draw>();
+    public static List<Vector2> globalCurve = new List<Vector2>();
+
+    private List<Vector2> localCurve = new List<Vector2>();
+    private bool isIndependent = false;
+
+    private LineRenderer line;
+    private float addPointThreshold = 0.005f;
+
+    void Awake()
+    {
+        // 메인 컨트롤러 지정 & 기본 선분 추가
+        if (mainController == null)
+        {
+            mainController = this;
+            if (globalCurve.Count < 2)
+            {
+                globalCurve.Add(new Vector2(0.25f, 0.25f));
+                globalCurve.Add(new Vector2(0.75f, 0.75f));
+            }
+        }
+
+        // 인스턴스 리스트에 추가
+        if (!instances.Contains(this))
+            instances.Add(this);
+
+        // 카메라 설정
+        if (mainCamera == null)
+            mainCamera = Camera.main;
+
+        // LineRenderer 컴포넌트 안전하게 얻거나 추가
+        line = GetComponent<LineRenderer>();
+        if (line == null)
+            line = gameObject.AddComponent<LineRenderer>();
+
+        // 이제부터 line 변수를 통해서만 속성에 접근!
+        line.useWorldSpace    = false;
+        line.widthMultiplier  = 0.05f;
+        line.material         = new Material(Shader.Find("Sprites/Default"));
+        line.startColor       = curveColor;
+        line.endColor         = curveColor;
+        line.positionCount    = 0;
+
+        // 클릭 검사용 Collider2D 자동 추가
+        if (GetComponent<Collider2D>() == null)
+            gameObject.AddComponent<BoxCollider2D>();
+    }
+
+    void Start()
+    {
+        // 메인/클론 구분해 localCurve 초기화
+        if (this == mainController)
+            localCurve = globalCurve;
+        else
+            localCurve = new List<Vector2>(globalCurve);
+
+        // 클론에만 transform 사전 변형 적용
+        if (this != mainController)
+            ApplyPreTransform();
+
+        Redraw();
+    }
+
+    void Update()
+    {
+        if (mainCamera == null) return;
+        Vector2 m = mainCamera.ScreenToWorldPoint(Input.mousePosition);
+
+        // [1] 왼쪽 드래그 : 메인만 globalCurve에 점 추가
+        if (Input.GetMouseButton(0) && this == mainController)
+        {
+            Vector2 lp = transform.InverseTransformPoint(m);
+            Vector2 n  = ToNormalized(lp);
+            if (IsInside(n) &&
+                (globalCurve.Count == 0 || Vector2.Distance(globalCurve[^1], n) > addPointThreshold))
+            {
+                globalCurve.Add(n);
+                PropagateGlobal();
+            }
+        }
+
+        // [2] 오른쪽 클릭 : 사분면 판정
+        if (Input.GetMouseButtonDown(1))
+        {
+            var hit = Physics2D.Raycast(m, Vector2.zero);
+            if (hit.collider != null && hit.collider.gameObject == gameObject)
+            {
+                Vector2 lp = transform.InverseTransformPoint(m);
+                Vector2 n  = ToNormalized(lp);
+                if (!IsInside(n)) return;
+
+                bool left = n.x < 0.5f, top = n.y > 0.5f;
+                if (this == mainController)
+                {
+                    // 왼쪽 아래 : 전체 삭제 + 독립 플래그 초기화
+                    if (left && !top)
+                    {
+                        globalCurve.Clear();
+                        foreach (var inst in instances)
+                            inst.isIndependent = false;
+                    }
+                    else if (left && top)      Rotate180(globalCurve);
+                    else if (!left && top)     MirrorY(globalCurve);
+                    else                         MirrorDiagonal(globalCurve);
+
+                    PropagateGlobal();
+                }
+                else
+                {
+                    // 클론 : 독립 모드 + localCurve 변형
+                    isIndependent = true;
+                    if (left && !top)          localCurve.Clear();
+                    else if (left && top)      Rotate180(localCurve);
+                    else if (!left && top)     MirrorY(localCurve);
+                    else                         MirrorDiagonal(localCurve);
+
+                    Redraw();
+                }
+            }
+        }
+    }
+
+    void PropagateGlobal()
+    {
+        foreach (var inst in instances)
+        {
+            if (inst == mainController)
+                inst.Redraw();
+            else if (!inst.isIndependent)
+            {
+                inst.localCurve = new List<Vector2>(globalCurve);
+                inst.Redraw();
+            }
+        }
+    }
+
+    // localCurve → 화면에 그리기
+    void Redraw()
+    {
+        int c = localCurve.Count;
+        if (c < 2)
+        {
+            line.positionCount = 0;
+            return;
+        }
+
+        var pts = new Vector3[c];
+        for (int i = 0; i < c; i++)
+        {
+            Vector2 p = FromNormalized(localCurve[i]);
+            pts[i] = new Vector3(p.x, p.y, 0);
+        }
+
+        line.positionCount = c;
+        line.SetPositions(pts);
+    }
+
+    // transform 만 바꾸는 사전 변형
+    void ApplyPreTransform()
+    {
+        switch (preTransform)
+        {
+            case PreTransform.Rotate180:
+                transform.rotation = Quaternion.Euler(0, 0, 180f);
+                break;
+            case PreTransform.MirrorY:
+                transform.localScale = new Vector3(-transform.localScale.x, transform.localScale.y, 1);
+                break;
+            case PreTransform.MirrorX:
+                transform.localScale = new Vector3(transform.localScale.x, -transform.localScale.y, 1);
+                break;
+            case PreTransform.Rotate90:
+                transform.rotation = Quaternion.Euler(0, 0, 90f);
+                break;
+            case PreTransform.MirrorDiagonal:    // y =  x
+                transform.rotation   = Quaternion.Euler(0, 0, 90f);
+                transform.localScale = new Vector3(transform.localScale.x, -transform.localScale.y, 1);
+                break;
+            case PreTransform.MirrorAntiDiagonal: // y = -x
+                transform.rotation   = Quaternion.Euler(0, 0, -90f);
+                transform.localScale = new Vector3(transform.localScale.x, -transform.localScale.y, 1);
+                break;
+        }
+    }
+
+    // 유틸리티
+    Vector2 ToNormalized(Vector2 lp)
+    {
+        var sz = GetComponent<SpriteRenderer>().bounds.size;
+        return new Vector2((lp.x + sz.x/2f)/sz.x, (lp.y + sz.y/2f)/sz.y);
+    }
+    Vector2 FromNormalized(Vector2 n)
+    {
+        var sz = GetComponent<SpriteRenderer>().bounds.size;
+        return new Vector2(n.x*sz.x - sz.x/2f, n.y*sz.y - sz.y/2f);
+    }
+    bool IsInside(Vector2 n) => n.x>=0f && n.x<=1f && n.y>=0f && n.y<=1f;
+
+    void Rotate180(List<Vector2> pts)      { for(int i=0;i<pts.Count;i++) pts[i] = -pts[i] + Vector2.one; }
+    void MirrorY(List<Vector2> pts)        { for(int i=0;i<pts.Count;i++){ var p=pts[i]; pts[i]=new Vector2(1-p.x,p.y);} }
+    void MirrorDiagonal(List<Vector2> pts) { for(int i=0;i<pts.Count;i++){ var p=pts[i]; pts[i]=new Vector2(p.y,p.x);} }
+}
